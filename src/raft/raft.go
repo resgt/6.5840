@@ -20,12 +20,13 @@ package raft
 import (
 	//	"bytes"
 
+	"6.5840/labgob"
+	"bytes"
 	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
-
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 )
@@ -120,14 +121,15 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	//Your code here (2C).
+	//Example:
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -136,18 +138,21 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	//Example:
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var voteFor int
+	var currentTerm int
+	var log []Entry
+	if d.Decode(&voteFor) != nil ||
+		d.Decode(&currentTerm) != nil ||
+		d.Decode(log) != nil {
+		DPrintf("readPersist failed\n")
+	} else {
+		rf.votedFor = voteFor
+		rf.currentTerm = currentTerm
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -183,6 +188,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Cmd:  command,
 	}
 	rf.log = append(rf.log, *newEntry)
+	rf.persist()
 	return len(rf.log) - 1, rf.currentTerm, true
 }
 
@@ -258,6 +264,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 		rf.currentTerm = args.Term // 易错点, 需要将currentTerm提升到最新的term
 		rf.role = Follower
+		rf.persist()
 	}
 
 	// at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
@@ -271,11 +278,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 			rf.role = Follower
 			rf.timeStamp = time.Now()
-
+			rf.persist()
 			rf.mu.Unlock()
 			reply.VoteGranted = true
 			DPrintf("server %v 同意向 server %v投票\n\targs= %+v\n", rf.me, args.CandidateId, args)
 			return
+		} else {
+			if args.LastLogTerm < rf.log[len(rf.log)-1].Term {
+				DPrintf("server %v 拒绝向 server %v 投票: 更旧的LastLogTerm, args = %+v\n", rf.me, args.CandidateId, args)
+			} else {
+				DPrintf("server %v 拒绝向 server %v 投票: 更短的Log, args = %+v\n", rf.me, args.CandidateId, args)
+			}
 		}
 	} else {
 		DPrintf("server %v 拒绝向 server %v投票: 已投票\n\targs= %+v\n", rf.me, args.CandidateId, args)
@@ -326,6 +339,7 @@ func (rf *Raft) GetVoteAnswer(server int, args *RequestVoteArgs) bool {
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.role = Follower
+		rf.persist()
 	}
 	return reply.VoteGranted
 }
@@ -405,19 +419,22 @@ type AppendEntriesReply struct {
 	// Your data here (2A).
 	Term    int  // currentTerm, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	XTerm   int  // Follower中与Leader冲突的Log对应的Term
+	XIndex  int  // Follower中，对应Term为XTerm的第一条Log条目的索引 冲突任期之后的那个任期日志索引开始的位置
+	XLen    int  // Follower的log的长度
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
 	// 新leader发送的第一个消息
 	rf.mu.Lock()
-
+	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		// 这是来自旧的leader的消息
 		// 1. Reply false if term < currentTerm (§5.1)
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		reply.Success = false
+		DPrintf("server %v 收到了旧的leader% v 的心跳函数, args=%+v, 更新的term: %v\n", rf.me, args.LeaderId, args, reply.Term)
 		return
 	}
 
@@ -431,6 +448,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term // 更新iterm
 		rf.votedFor = -1           // 易错点: 更新投票记录为未投票
 		rf.role = Follower
+		rf.persist()
 	}
 
 	if len(args.Entries) == 0 {
@@ -438,28 +456,48 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		DPrintf("server %v 收到 leader %v 的的AppendEntries: %+v \n", rf.me, args.LeaderId, args)
 	}
-
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// 校验不合法
+	isConflict := false
+	// 校验PrevLogIndex和PrevLogTerm不合法
+	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.XTerm = -1
+		reply.XLen = len(rf.log)
+		isConflict = true
+		DPrintf("server %v 的log在PrevLogIndex: %v 位置不存在日志项, Log长度为%v\n", rf.me, args.PrevLogIndex, reply.XLen)
+	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// PrevLogIndex位置的日志项存在, 但term不匹配
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		i := args.PrevLogIndex
+		// 找到当前冲突任期的上个任期
+		for rf.log[i].Term == reply.XTerm {
+			i--
+		}
+		reply.XIndex = i + 1
+		isConflict = true
+		DPrintf("server %v 的log在PrevLogIndex: %v 位置Term不匹配, args.Term=%v, 实际的term=%v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, reply.XTerm)
+	}
+	if isConflict {
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		reply.Success = false
-		DPrintf("server %v 检查到心跳中参数不合法:\n\t args.PrevLogIndex=%v, args.PrevLogTerm=%v, \n\tlen(self.log)=%v, self最后一个位置term为:%v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, len(rf.log), rf.log[len(rf.log)-1].Term)
 		return
 	}
 
 	// 3. If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
-	// follow it (§5.3) 如果要添加的日志和已经存在但是任期不同
-	if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex+1 && rf.log[args.PrevLogIndex+1].Term != args.Entries[0].Term {
-		// 发生了冲突, 移除冲突位置开始后面所有的内容
-		DPrintf("server %v 的log与args发生冲突, 进行移除\n", rf.me)
+	// follow it (§5.3) 如果要添加的日志和已经存在但是任期不同 重复的rpc会直接通过校验然后在最后直接追加
+	//if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex+1 && rf.log[args.PrevLogIndex+1].Term != args.Entries[0].Term {
+	//	// 发生了冲突, 移除冲突位置开始后面所有的内容
+	//	DPrintf("server %v 的log与args发生冲突, 进行移除\n", rf.me)
+	//	rf.log = rf.log[:args.PrevLogIndex+1]
+	//}
+	// 不管是否冲突 直接移除 避免重复的rpc
+	if len(args.Entries) != 0 && len(rf.log) > args.PrevLogIndex {
 		rf.log = rf.log[:args.PrevLogIndex+1]
 	}
-
 	// 4. Append any new entries not already in the log
 	// 补充apeend的业务
 	rf.log = append(rf.log, args.Entries...)
+	rf.persist()
 	if len(args.Entries) != 0 {
 		DPrintf("server %v 成功进行apeend\n", rf.me)
 	}
@@ -470,7 +508,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 5.If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.log)-1)))
 	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) sendAppendEntries(serverTo int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -497,8 +534,10 @@ func (rf *Raft) handleHeartBeat(serverTo int, args *AppendEntriesArgs) {
 	if reply.Term > rf.currentTerm {
 		DPrintf("server %v 旧的leader收到了心跳函数中更新的term: %v, 转化为Follower\n", rf.me, reply.Term)
 		rf.currentTerm = reply.Term
+		rf.timeStamp = time.Now()
 		rf.votedFor = -1
 		rf.role = Follower
+		rf.persist()
 	}
 }
 
@@ -547,11 +586,12 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 		return
 	}
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	// 根据rpc接口的返回值更新commitIndex
 	if args.Term != rf.currentTerm {
 		// 函数调用间隙值变了, 已经不是发起这个调用时的term了
 		// 要先判断term是否改变, 否则后续的更改matchIndex等是不安全的
-		rf.mu.Unlock()
 		return
 	}
 
@@ -579,7 +619,6 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 			}
 			N--
 		}
-		rf.mu.Unlock()
 		return
 	}
 
@@ -590,14 +629,35 @@ func (rf *Raft) handleAppendEntries(serverTo int, args *AppendEntriesArgs) {
 		rf.votedFor = -1
 		rf.currentTerm = reply.Term
 		rf.timeStamp = time.Now()
-		rf.mu.Unlock()
 		return
 	}
 
-	// term仍然相同, 且自己还是leader, 表名对应的follower在prevLogIndex位置没有与prevLogTerm匹配的项
+	// term仍然相同, 且自己还是leader, 表明对应的follower在prevLogIndex位置没有与prevLogTerm匹配的项
+	// 2C实现了快速回退 不必一次回退一个index可以回退多个
 	if reply.Term == rf.currentTerm && rf.role == Leader {
-		rf.nextIndex[serverTo]--
-		rf.mu.Unlock()
+		// term仍然相同, 且自己还是leader, 表名对应的follower在prevLogIndex位置没有与prevLogTerm匹配的项
+		// 快速回退的处理
+		// follower中不存在PrevLogIndex这个日志索引
+		if reply.XTerm == -1 {
+			DPrintf("leader %v 收到 server %v 的回退请求, 原因是log过短, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, serverTo, rf.nextIndex[serverTo], serverTo, reply.XLen)
+			rf.nextIndex[serverTo] = reply.XLen //从从节点的日志最后面开始同步
+			return
+		}
+		// 说明不是索引冲突而是任期冲突
+		i := rf.nextIndex[serverTo] - 1
+		// 找到当前冲突任期的上一任
+		for i > 0 && rf.log[i].Term > reply.XTerm {
+			i--
+		}
+		if rf.log[i].Term == reply.XTerm {
+			// 之前PrevLogIndex发生冲突位置时, Follower的Term自己也有
+			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的最后一个XTerm索引为%v, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, i, serverTo, rf.nextIndex[serverTo], serverTo, i+1)
+			rf.nextIndex[serverTo] = i + 1 //i是领导节点的
+		} else {
+			// 之前PrevLogIndex发生冲突位置时, Follower的Term自己没有
+			DPrintf("leader %v 收到 server %v 的回退请求, 冲突位置的Term为%v, server的这个Term从索引%v开始, 而leader对应的XTerm不存在, 回退前的nextIndex[%v]=%v, 回退后的nextIndex[%v]=%v\n", rf.me, serverTo, reply.XTerm, reply.XIndex, serverTo, rf.nextIndex[serverTo], serverTo, reply.XIndex)
+			rf.nextIndex[serverTo] = reply.XIndex //XIndex是从节点的
+		}
 		return
 	}
 }
